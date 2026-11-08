@@ -8,3 +8,6 @@ synthetic INTEGER NOT NULL DEFAULT 0, github_synced INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS chat_events_unsynced ON chat_events(github_synced,created_at);
 CREATE INDEX IF NOT EXISTS chat_events_session ON chat_events(session_id,created_at);
+CREATE TABLE IF NOT EXISTS backup_state (id TEXT PRIMARY KEY, checked_at INTEGER NOT NULL DEFAULT 0, lease_until INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS ended_sessions (session_id TEXT PRIMARY KEY);
+INSERT OR IGNORE INTO backup_state(id) VALUES ('lock');

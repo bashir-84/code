@@ -8,3 +8,8 @@ binding = "ASSETS"
 
 [vars]
 ALLOWED_ORIGINS = "https://bashiramri.ir,https://bashir-84.github.io"
+
+[[d1_databases]]
+binding = "LOG_DB"
+database_name = "foxley-chat-logs"
+database_id = "e206fcc0-a443-4b3c-affe-c8d2c451e916"

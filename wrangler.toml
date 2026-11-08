@@ -1,0 +1,10 @@
+name = "foxley-chat"
+main = "worker.js"
+compatibility_date = "2026-11-01"
+
+[assets]
+directory = "./public"
+binding = "ASSETS"
+
+[vars]
+ALLOWED_ORIGINS = "https://bashiramri.ir,https://bashir-84.github.io"

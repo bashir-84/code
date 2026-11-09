@@ -75,8 +75,36 @@ return json({reply,logSaved,eventId:logId,passwordDisclosed:disclosed,...(disclo
 }catch(e){await finish('error');return json({error:'درخواست کامل نشد؛ اتصال و تنظیمات را بررسی کن.'},502)}
 }};
 
-const BACKUP_HEADER = "FOXLEY CHAT BACKUP — v2\nگزارش عمومی تست فاکسلی؛ رمز و کلیدها حذف شده‌اند.\nانتقال پس از ۵ دقیقه از شروع نشست و در پایان نشست؛ بررسی مجدد هر ۳۰ دقیقه.\nشناسه EVENT یکتا است؛ هر رویداد در همان فایل به‌روزرسانی می‌شود.\n--- EVENTS ---\n";
-function backupEvent(e){return "\n[EVENT "+e.id+"]\n"+JSON.stringify(e,null,2)+"\n[END EVENT "+e.id+"]\n"}
+const BACKUP_HEADER = "FOXLEY CHAT BACKUP — v3\nگفت‌وگوها بر اساس نشست گروه‌بندی شده‌اند. هر پیام فقط یک بار نمایش داده می‌شود.\nرمزها و کلیدهای API پیش از انتشار حذف می‌شوند.\nاطلاعات نشست در آغاز هر گفت‌وگو و وضعیت کلی در همان سربرگ درج می‌شود.\n--- SESSIONS ---\n";
+function backupSession(sessionId, events) {
+ const first=events[0], last=events.at(-1);
+ const disclosed=events.some(e=>Number(e.password_disclosed)===1);
+ const hinted=events.some(e=>e.kind==='hint'||Number(e.hint_used)===1);
+ const synthetic=events.every(e=>Number(e.synthetic)===1);
+ const levels=[...new Set(events.map(e=>e.level).filter(Boolean))].join(', ');
+ const models=[...new Set(events.map(e=>e.model).filter(Boolean))].join(', ');
+ const versions=[...new Set(events.map(e=>e.prompt_version).filter(Boolean))].join(', ');
+ const incomplete=events.filter(e=>e.status!=='complete').length;
+ let out="\n==================================================\n[SESSION "+sessionId+"]\n";
+ out+="زمان شروع: "+first.created_at+"\nآخرین پیام: "+last.created_at+"\n";
+ out+="سطح: "+levels+" | مدل: "+models+"\nنسخه پرامپت: "+versions+"\n";
+ out+="تعداد رویداد: "+events.length+" | وضعیت: "+(incomplete?incomplete+" رویداد ناتمام":"کامل")+"\n";
+ out+="افشای رمز: "+(disclosed?"بله":"خیر")+" | استفاده از راهنما: "+(hinted?"بله":"خیر")+" | تست فنی: "+(synthetic?"بله":"خیر")+"\n";
+ out+="--------------------------------------------------\n";
+ for(const e of events){
+  out+="\n["+e.created_at+" | "+e.kind+" | "+e.id+"]\n";
+  if(e.kind==='hint'){
+   out+="💡 درخواست راهنما\n";
+   if(e.assistant_text)out+="راهنما: "+e.assistant_text+"\n";
+  }else{
+   out+="بازیکن: "+(e.user_text||"")+"\n";
+   if(e.assistant_text)out+="فاکسلی: "+e.assistant_text+"\n";
+  }
+  if(e.status!=='complete')out+="وضعیت پیام: "+e.status+"\n";
+  if(Number(e.password_disclosed)===1)out+="🔓 افشای رمز در این پیام ثبت شد.\n";
+ }
+ return out+"\n[END SESSION "+sessionId+"]\n";
+}
 function safeBackup(text,env){for(const key of ['GAME_PASSWORD','GROQ_API_KEY','GITHUB_TOKEN'])if(env[key])text=text.split(env[key]).join(key==='GAME_PASSWORD'?'[GAME_PASSWORD]':'[REDACTED_API_KEY]');return text.replace(/gsk_[A-Za-z0-9_-]+|github_pat_[A-Za-z0-9_]+|gh[pousr]_[A-Za-z0-9_]+/g,'[REDACTED_API_KEY]')}
 async function syncBackup(env){
  if(!env.GITHUB_TOKEN||!env.LOG_DB)throw Error('Backup bindings missing');
@@ -84,29 +112,29 @@ async function syncBackup(env){
  const acquired=await db.prepare("UPDATE backup_state SET lease_until=? WHERE id='lock' AND lease_until<?").bind(lease,now).run();
  if(!acquired.meta.changes)return;
  try{
- const due="(e.session_id IN (SELECT session_id FROM chat_events GROUP BY session_id HAVING MIN(created_at)<=?) OR e.session_id IN (SELECT session_id FROM ended_sessions))";
- const cutoff=new Date(now-300000).toISOString();
- const groups=await db.prepare("SELECT CAST((e.rowid-1)/50 AS INTEGER) AS chunk, MIN(COALESCE(s.checked_at,0)) AS checked FROM chat_events e LEFT JOIN backup_state s ON s.id='chunk:'||CAST((e.rowid-1)/50 AS INTEGER) WHERE "+due+" GROUP BY chunk HAVING MIN(e.github_synced)=0 OR checked<? ORDER BY checked LIMIT 5").bind(cutoff,now-1800000).all();
- for(const g of groups.results){
- const rows=await db.prepare("SELECT e.rowid AS backup_rowid,e.* FROM chat_events e WHERE CAST((e.rowid-1)/50 AS INTEGER)=? AND "+due+" ORDER BY e.rowid").bind(g.chunk,cutoff).all();
- const events=rows.results.map(({backup_rowid,github_synced,...e})=>e);
- const text=safeBackup(BACKUP_HEADER+events.map(backupEvent).join(''),env);
- const bytes=new TextEncoder().encode(text); let binary='';for(const b of bytes)binary+=String.fromCharCode(b);const content=btoa(binary);
- const path=g.chunk===0?'logs/chat-backup.txt':'logs/chat-backup-'+String(g.chunk+1).padStart(5,'0')+'.txt';
- const url='https://api.github.com/repos/bashir-84/code/contents/'+path;
- const headers={Authorization:'Bearer '+env.GITHUB_TOKEN,Accept:'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28','User-Agent':'foxley-chat-backup','Content-Type':'application/json'};
- const old=await fetch(url,{headers,signal:AbortSignal.timeout(15000)});
- let sha, unchanged=false;
- if(old.ok){const data=await old.json();sha=data.sha;unchanged=(data.content||'').replace(/\s/g,'')===content;}
- else if(old.status!==404)throw Error('GitHub read '+old.status);
- if(!unchanged){
- const saved=await fetch(url,{method:'PUT',headers,body:JSON.stringify({message:'Sync Foxley chat events (chunk '+g.chunk+')',content,...(sha?{sha}:{})}),signal:AbortSignal.timeout(15000)});
- if(!saved.ok)throw Error('GitHub write '+saved.status);
- await saved.arrayBuffer();
- }
- // Only mark the exact revision read above: a response finishing during export remains queued.
- for(const e of rows.results)await db.prepare("UPDATE chat_events SET github_synced=1 WHERE id=? AND status=? AND assistant_text=?").bind(e.id,e.status,e.assistant_text).run();
- await db.prepare("INSERT INTO backup_state(id,checked_at) VALUES (?,?) ON CONFLICT(id) DO UPDATE SET checked_at=excluded.checked_at").bind('chunk:'+g.chunk,now).run();
- }
+  const cutoff=new Date(now-300000).toISOString();
+  const sessionOrder="WITH ordered AS (SELECT session_id, MIN(rowid) AS first_row, MIN(created_at) AS first_at, CAST((ROW_NUMBER() OVER (ORDER BY MIN(rowid),session_id)-1)/10 AS INTEGER) AS chunk FROM chat_events GROUP BY session_id), eligible AS (SELECT o.* FROM ordered o WHERE o.first_at<=? OR o.session_id IN (SELECT session_id FROM ended_sessions)) ";
+  const groups=await db.prepare(sessionOrder+"SELECT eligible.chunk AS chunk, MIN(COALESCE(s.checked_at,0)) AS checked, MIN(e.github_synced) AS synced FROM eligible JOIN chat_events e ON e.session_id=eligible.session_id LEFT JOIN backup_state s ON s.id='sessionchunk:'||eligible.chunk GROUP BY eligible.chunk HAVING MIN(e.github_synced)=0 OR MIN(COALESCE(s.checked_at,0))<? ORDER BY checked,chunk LIMIT 5").bind(cutoff,now-1800000).all();
+  for(const g of groups.results){
+   const result=await db.prepare(sessionOrder+"SELECT e.* FROM eligible JOIN chat_events e ON e.session_id=eligible.session_id WHERE eligible.chunk=? ORDER BY eligible.first_row,e.created_at,e.rowid").bind(cutoff,g.chunk).all();
+   const sessions=new Map();
+   for(const {github_synced,...event} of result.results){if(!sessions.has(event.session_id))sessions.set(event.session_id,[]);sessions.get(event.session_id).push(event)}
+   const contentText=safeBackup(BACKUP_HEADER+[...sessions].map(([id,events])=>backupSession(id,events)).join(''),env);
+   const bytes=new TextEncoder().encode(contentText);let binary='';for(const b of bytes)binary+=String.fromCharCode(b);const content=btoa(binary);
+   const path=g.chunk===0?'logs/chat-backup.txt':'logs/chat-backup-'+String(g.chunk+1).padStart(5,'0')+'.txt';
+   const url='https://api.github.com/repos/bashir-84/code/contents/'+path;
+   const headers={Authorization:'Bearer '+env.GITHUB_TOKEN,Accept:'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28','User-Agent':'foxley-chat-backup','Content-Type':'application/json'};
+   const old=await fetch(url,{headers,signal:AbortSignal.timeout(15000)});
+   let sha, unchanged=false;
+   if(old.ok){const data=await old.json();sha=data.sha;unchanged=(data.content||'').replace(/\s/g,'')===content}
+   else if(old.status!==404)throw Error('GitHub read '+old.status);
+   if(!unchanged){
+    const saved=await fetch(url,{method:'PUT',headers,body:JSON.stringify({message:'Sync Foxley sessions (group '+g.chunk+')',content,...(sha?{sha}:{})}),signal:AbortSignal.timeout(15000)});
+    if(!saved.ok)throw Error('GitHub write '+saved.status);
+    await saved.arrayBuffer();
+   }
+   for(const e of result.results)await db.prepare("UPDATE chat_events SET github_synced=1 WHERE id=? AND status=? AND assistant_text=?").bind(e.id,e.status,e.assistant_text).run();
+   await db.prepare("INSERT INTO backup_state(id,checked_at) VALUES (?,?) ON CONFLICT(id) DO UPDATE SET checked_at=excluded.checked_at").bind('sessionchunk:'+g.chunk,now).run();
+  }
  }finally{await db.prepare("UPDATE backup_state SET lease_until=0 WHERE id='lock' AND lease_until=?").bind(lease).run()}
 }
